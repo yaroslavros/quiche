@@ -976,10 +976,16 @@ impl<H: DriverHooks> H3Driver<H> {
                 }
 
                 // A taken-over stream is written straight on the transport,
-                // with neither framing nor HTTP/3 in the path.
+                // with neither framing nor HTTP/3 in the path. Still zero
+                // copy: `stream_send_zc` takes the buffer, where plain
+                // `stream_send` would copy out of a borrowed slice and make
+                // the handover cost more per byte than the framing it saves.
+                //
+                // The returned remainder is the unsent tail of `body`, which
+                // `advance` leaves in place, so it is dropped here.
                 let n = if ctx.released {
-                    let n = qconn
-                        .stream_send(stream_id, body, *fin)
+                    let (n, _tail) = qconn
+                        .stream_send_zc(stream_id, body.clone(), *fin)
                         .map_err(h3::Error::TransportError)?;
                     bytes::Buf::advance(body, n);
                     n

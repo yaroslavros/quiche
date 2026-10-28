@@ -579,6 +579,7 @@ pub struct Config {
     qpack_max_table_capacity: Option<u64>,
     qpack_blocked_streams: Option<u64>,
     connect_protocol_enabled: Option<u64>,
+    unbound_data_enabled: Option<u64>,
     /// additional settings are settings that are not part of the H3
     /// settings explicitly handled above
     additional_settings: Option<Vec<(u64, u64)>>,
@@ -594,6 +595,7 @@ impl Config {
             qpack_max_table_capacity: None,
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
+            unbound_data_enabled: None,
             additional_settings: None,
             max_priority_update_size:
                 PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
@@ -642,6 +644,30 @@ impl Config {
             self.connect_protocol_enabled = Some(1);
         } else {
             self.connect_protocol_enabled = None;
+        }
+    }
+
+    /// Sets or clears the `SETTINGS_ENABLE_UNBOUND_DATA` setting.
+    ///
+    /// Advertising it tells the peer that this endpoint accepts `UNBOUND_DATA`
+    /// frames on CONNECT streams, after which the stream carries tunnel data
+    /// with no HTTP/3 framing. The setting is directional: whether this
+    /// endpoint may *send* the frame depends on the peer's setting, which
+    /// [`Connection::unbound_data_enabled_by_peer()`] reports.
+    ///
+    /// The frame is only valid on CONNECT streams, and HTTP/3 does not track
+    /// request methods: the application is responsible for only using unbound
+    /// data on CONNECT streams.
+    ///
+    /// See [draft-rosomakho-httpbis-h3-unbound-data].
+    ///
+    /// [draft-rosomakho-httpbis-h3-unbound-data]:
+    ///     https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/
+    pub fn enable_unbound_data(&mut self, enabled: bool) {
+        if enabled {
+            self.unbound_data_enabled = Some(1);
+        } else {
+            self.unbound_data_enabled = None;
         }
     }
 
@@ -814,6 +840,25 @@ pub enum Event {
     /// [`Done`]: enum.Error.html#variant.Done
     Data,
 
+    /// An `UNBOUND_DATA` frame was received on a CONNECT stream.
+    ///
+    /// Every octet which follows on this direction of the stream is tunneled
+    /// data up to the QUIC FIN, with no HTTP/3 framing. The application can
+    /// either keep reading it with [`recv_body()`], which no longer sees frame
+    /// boundaries, or take the stream over with [`take_unbound_stream()`] and
+    /// read it with [`stream_recv()`] directly.
+    ///
+    /// This event is reported once per stream, before any tunnel data.
+    ///
+    /// See [draft-rosomakho-httpbis-h3-unbound-data].
+    ///
+    /// [`recv_body()`]: struct.Connection.html#method.recv_body
+    /// [`take_unbound_stream()`]: struct.Connection.html#method.take_unbound_stream
+    /// [`stream_recv()`]: ../struct.Connection.html#method.stream_recv
+    /// [draft-rosomakho-httpbis-h3-unbound-data]:
+    ///     https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/
+    UnboundData,
+
     /// Stream was closed,
     Finished,
 
@@ -945,6 +990,7 @@ struct ConnectionSettings {
     pub qpack_blocked_streams: Option<u64>,
     pub connect_protocol_enabled: Option<u64>,
     pub h3_datagram: Option<u64>,
+    pub unbound_data_enabled: Option<u64>,
     pub additional_settings: Option<Vec<(u64, u64)>>,
     pub raw: Option<Vec<(u64, u64)>>,
 }
@@ -1052,6 +1098,7 @@ impl Connection {
                 qpack_blocked_streams: config.qpack_blocked_streams,
                 connect_protocol_enabled: config.connect_protocol_enabled,
                 h3_datagram,
+                unbound_data_enabled: config.unbound_data_enabled,
                 additional_settings: config.additional_settings.clone(),
                 raw: Default::default(),
             },
@@ -1062,6 +1109,7 @@ impl Connection {
                 qpack_blocked_streams: None,
                 h3_datagram: None,
                 connect_protocol_enabled: None,
+                unbound_data_enabled: None,
                 additional_settings: Default::default(),
                 raw: Default::default(),
             },
@@ -1177,6 +1225,7 @@ impl Connection {
                     .max_field_section_size
                     .unwrap_or(SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT),
                 self.max_priority_update_size,
+                self.unbound_data_enabled_locally(),
             ),
         );
 
@@ -1384,6 +1433,14 @@ impl Connection {
 
                 // Only one trailing HEADERS allowed.
                 if s.trailers_sent() {
+                    return Err(Error::FrameUnexpected);
+                }
+
+                // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.2:
+                // after `UNBOUND_DATA` the sender cannot send further HTTP/3
+                // frames on the stream, and a handed-over stream is no longer
+                // HTTP/3's to write.
+                if s.send_unbound() || s.released() {
                     return Err(Error::FrameUnexpected);
                 }
 
@@ -1704,6 +1761,10 @@ impl Connection {
                 if s.trailers_sent() {
                     return Err(Error::FrameUnexpected);
                 }
+
+                if s.released() {
+                    return Err(Error::FrameUnexpected);
+                }
             },
 
             None => {
@@ -1716,8 +1777,20 @@ impl Connection {
             return Err(Error::Done);
         }
 
-        let overhead = octets::varint_len(frame::DATA_FRAME_TYPE_ID) +
-            octets::varint_len(len as u64);
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.2:
+        // once `UNBOUND_DATA` was sent, every octet on this direction of the
+        // stream is tunnel data, so the body is written with no frame header.
+        let send_unbound = self
+            .streams
+            .get(&stream_id)
+            .is_some_and(|s| s.send_unbound());
+
+        let overhead = if send_unbound {
+            0
+        } else {
+            octets::varint_len(frame::DATA_FRAME_TYPE_ID) +
+                octets::varint_len(len as u64)
+        };
 
         let stream_cap = match conn.stream_capacity(stream_id) {
             Ok(v) => v,
@@ -1750,8 +1823,13 @@ impl Connection {
             return Err(Error::Done);
         }
 
-        b.put_varint(frame::DATA_FRAME_TYPE_ID)?;
-        b.put_varint(body_len as u64)?;
+        if !send_unbound {
+            b.put_varint(frame::DATA_FRAME_TYPE_ID)?;
+            b.put_varint(body_len as u64)?;
+        }
+
+        // Empty when the sending side is unbound: the tunnel data is written
+        // with no frame header in front of it.
         let off = b.off();
 
         // Return how many bytes were written, excluding the frame header.
@@ -1827,6 +1905,180 @@ impl Connection {
         self.peer_settings.connect_protocol_enabled == Some(1)
     }
 
+    /// Returns whether the peer enabled unbound data support.
+    ///
+    /// Support is signalled by the peer's SETTINGS, so this method always
+    /// returns false until they have been processed using the [`poll()`]
+    /// method. An endpoint must not send `UNBOUND_DATA` until it returns true.
+    ///
+    /// See [draft-rosomakho-httpbis-h3-unbound-data].
+    ///
+    /// [`poll()`]: struct.Connection.html#method.poll
+    /// [draft-rosomakho-httpbis-h3-unbound-data]:
+    ///     https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/
+    pub fn unbound_data_enabled_by_peer(&self) -> bool {
+        self.peer_settings.unbound_data_enabled == Some(1)
+    }
+
+    /// Returns whether this endpoint advertised unbound data support.
+    fn unbound_data_enabled_locally(&self) -> bool {
+        self.local_settings.unbound_data_enabled == Some(1)
+    }
+
+    /// Stops HTTP/3 framing on the sending side of a CONNECT stream.
+    ///
+    /// Sends an `UNBOUND_DATA` frame, after which every octet written to the
+    /// stream is tunnel data up to the QUIC FIN. [`send_body()`] keeps working
+    /// and writes the body with no frame header; trailers and additional
+    /// headers can no longer be sent.
+    ///
+    /// The peer must have advertised `SETTINGS_ENABLE_UNBOUND_DATA`, which
+    /// [`unbound_data_enabled_by_peer()`] reports; otherwise
+    /// [`FrameUnexpected`] is returned and nothing is written, so the
+    /// application can simply keep using `DATA` frames.
+    ///
+    /// The frame is only valid on CONNECT streams. HTTP/3 does not track
+    /// request methods, so the application is responsible for only calling this
+    /// on a stream which carries a CONNECT request.
+    ///
+    /// [`Done`] is returned if the stream has no capacity for the frame, in
+    /// which case the call should be retried once the stream is writable.
+    ///
+    /// Calling this again once the sending side is unbound does nothing.
+    ///
+    /// See [draft-rosomakho-httpbis-h3-unbound-data].
+    ///
+    /// [`send_body()`]: struct.Connection.html#method.send_body
+    /// [`unbound_data_enabled_by_peer()`]:
+    ///     struct.Connection.html#method.unbound_data_enabled_by_peer
+    /// [`FrameUnexpected`]: enum.Error.html#variant.FrameUnexpected
+    /// [`Done`]: enum.Error.html#variant.Done
+    /// [draft-rosomakho-httpbis-h3-unbound-data]:
+    ///     https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/
+    pub fn send_unbound_data<F: BufFactory>(
+        &mut self, conn: &mut super::Connection<F>, stream_id: u64,
+    ) -> Result<()> {
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 3:
+        // Endpoints MUST NOT send an `UNBOUND_DATA` frame to a peer that has
+        // not advertised `SETTINGS_ENABLE_UNBOUND_DATA` with value 1.
+        if !self.unbound_data_enabled_by_peer() {
+            return Err(Error::FrameUnexpected);
+        }
+
+        // Only request streams carry CONNECT.
+        if !crate::stream::is_bidi(stream_id) {
+            return Err(Error::FrameUnexpected);
+        }
+
+        match self.streams.get(&stream_id) {
+            Some(s) => {
+                if s.send_unbound() {
+                    return Ok(());
+                }
+
+                // The frame must follow the HEADERS which opened the tunnel,
+                // and nothing may follow trailers.
+                if !s.local_initialized() || s.trailers_sent() || s.released() {
+                    return Err(Error::FrameUnexpected);
+                }
+            },
+
+            None => return Err(Error::FrameUnexpected),
+        };
+
+        let frame = frame::Frame::UnboundData;
+
+        let mut d = [42; 16];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+        let len = frame.to_bytes(&mut b)?;
+
+        let stream_cap = match conn.stream_capacity(stream_id) {
+            Ok(v) => v,
+
+            Err(e) => {
+                if conn.stream_finished(stream_id) {
+                    self.streams.remove(&stream_id);
+                }
+
+                return Err(e.into());
+            },
+        };
+
+        // The frame is written whole or not at all, so that the stream never
+        // carries a partial frame followed by tunnel data.
+        if stream_cap < len {
+            let _ = conn.stream_writable(stream_id, len)?;
+
+            return Err(Error::Done);
+        }
+
+        conn.stream_send(stream_id, &d[..len], false)?;
+
+        trace!(
+            "{} tx frm UNBOUND_DATA stream={}",
+            conn.trace_id(),
+            stream_id
+        );
+
+        qlog_with_type!(QLOG_FRAME_CREATED, conn.qlog, q, {
+            let ev_data = EventData::Http3FrameCreated(FrameCreated {
+                stream_id,
+                length: Some(len as u64),
+                frame: frame.to_qlog(),
+                ..Default::default()
+            });
+
+            q.add_event_data_now(ev_data).ok();
+        });
+
+        if let Some(s) = self.streams.get_mut(&stream_id) {
+            s.set_send_unbound();
+        }
+
+        Ok(())
+    }
+
+    /// Hands an unbound CONNECT stream over to the application.
+    ///
+    /// After this call HTTP/3 neither reads nor writes the stream: [`poll()`]
+    /// ignores it and [`recv_body()`]/[`send_body()`] reject it. The
+    /// application reads and writes the tunnel with
+    /// [`stream_recv()`]/[`stream_send()`] on the transport connection instead,
+    /// and is responsible for the stream's FIN and for resetting it.
+    ///
+    /// Nothing is buffered on HTTP/3's side when a stream goes unbound, so no
+    /// tunnel data is lost or needs to be drained first: every byte which has
+    /// not been read yet is still in the transport's receive buffer.
+    ///
+    /// The receiving side must already be unbound, which the [`UnboundData`]
+    /// event reports; otherwise [`FrameUnexpected`] is returned, since HTTP/3
+    /// would still have framing to parse. Note that this does not require the
+    /// sending side to be unbound: a tunnel may legitimately be unbound in one
+    /// direction only, in which case the application also takes over writing.
+    ///
+    /// See [draft-rosomakho-httpbis-h3-unbound-data].
+    ///
+    /// [`poll()`]: struct.Connection.html#method.poll
+    /// [`recv_body()`]: struct.Connection.html#method.recv_body
+    /// [`send_body()`]: struct.Connection.html#method.send_body
+    /// [`stream_recv()`]: ../struct.Connection.html#method.stream_recv
+    /// [`stream_send()`]: ../struct.Connection.html#method.stream_send
+    /// [`UnboundData`]: enum.Event.html#variant.UnboundData
+    /// [`FrameUnexpected`]: enum.Error.html#variant.FrameUnexpected
+    /// [draft-rosomakho-httpbis-h3-unbound-data]:
+    ///     https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/
+    pub fn take_unbound_stream(&mut self, stream_id: u64) -> Result<()> {
+        let stream = self.streams.get_mut(&stream_id).ok_or(Error::Done)?;
+
+        if !stream.recv_unbound() {
+            return Err(Error::FrameUnexpected);
+        }
+
+        stream.release();
+
+        Ok(())
+    }
+
     /// Reads request or response body data into the provided buffer.
     ///
     /// Applications should call this method whenever the [`poll()`] method
@@ -1894,11 +2146,25 @@ impl Connection {
         while out.has_remaining_mut() {
             let stream = self.streams.get_mut(&stream_id).ok_or(Error::Done)?;
 
-            if stream.state() != stream::State::Data {
-                break;
+            // Unbound tunnel data is delivered the same way, just without
+            // frame boundaries to respect.
+            let unbound = match stream.state() {
+                stream::State::Data => false,
+                stream::State::UnboundData => true,
+                _ => break,
+            };
+
+            if stream.released() {
+                return Err(Error::FrameUnexpected);
             }
 
-            let (read, fin) = match stream.try_consume_data(conn, &mut out) {
+            let consumed = if unbound {
+                stream.try_consume_unbound_data(conn, &mut out)
+            } else {
+                stream.try_consume_data(conn, &mut out)
+            };
+
+            let (read, fin) = match consumed {
                 Ok(v) => v,
 
                 Err(Error::Done) => break,
@@ -2539,6 +2805,7 @@ impl Connection {
                 .local_settings
                 .connect_protocol_enabled,
             h3_datagram: self.local_settings.h3_datagram,
+            unbound_data_enabled: self.local_settings.unbound_data_enabled,
             grease,
             additional_settings: self.local_settings.additional_settings.clone(),
             raw: Default::default(),
@@ -2602,6 +2869,8 @@ impl Connection {
     fn process_readable_stream<F: BufFactory>(
         &mut self, conn: &mut super::Connection<F>, stream_id: u64, polling: bool,
     ) -> Result<(u64, Event)> {
+        let unbound_data_enabled = self.unbound_data_enabled_locally();
+
         self.streams.entry(stream_id).or_insert_with(|| {
             <stream::Stream>::new(
                 stream_id,
@@ -2610,8 +2879,20 @@ impl Connection {
                     .max_field_section_size
                     .unwrap_or(SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT),
                 self.max_priority_update_size,
+                unbound_data_enabled,
             )
         });
+
+        // The application took this stream over after it went unbound, so its
+        // bytes are no longer HTTP/3's to read: parsing them would both corrupt
+        // the tunnel and desync the frame parser.
+        if self
+            .streams
+            .get(&stream_id)
+            .is_some_and(|stream| stream.released())
+        {
+            return Err(Error::Done);
+        }
 
         // We need to get a fresh reference to the stream for each
         // iteration, to avoid borrowing `self` for the entire duration
@@ -2908,6 +3189,41 @@ impl Connection {
                     return Ok((stream_id, Event::Data));
                 },
 
+                stream::State::UnboundData => {
+                    // Do not emit events when not polling.
+                    if !polling {
+                        break;
+                    }
+
+                    // Report the switch once, as soon as the frame is parsed,
+                    // so the application can take the stream over before any
+                    // tunnel data arrives.
+                    if stream.try_trigger_unbound_event() {
+                        return Ok((stream_id, Event::UnboundData));
+                    }
+
+                    // See the matching comment in the `Data` arm: surface a
+                    // reset directly rather than behind an empty read.
+                    if conn.stream_finished(stream_id) {
+                        if let Err(crate::Error::StreamReset(e)) =
+                            conn.stream_recv(stream_id, &mut [])
+                        {
+                            return Err(Error::TransportError(
+                                crate::Error::StreamReset(e),
+                            ));
+                        }
+                    }
+
+                    // Tunnel data is delivered through `recv_body()` like any
+                    // other body data, so applications which do not take the
+                    // stream over keep working unchanged.
+                    if !stream.try_trigger_data_event() {
+                        break;
+                    }
+
+                    return Ok((stream_id, Event::Data));
+                },
+
                 stream::State::QpackInstruction => {
                     let mut d = [0; 4096];
 
@@ -3078,12 +3394,18 @@ impl Connection {
         });
 
         match frame {
+            // Handled by the stream state machine: an `UNBOUND_DATA` frame has
+            // no payload to parse and switches the stream to
+            // `State::UnboundData`, so it never reaches this point.
+            frame::Frame::UnboundData => (),
+
             frame::Frame::Settings {
                 max_field_section_size,
                 qpack_max_table_capacity,
                 qpack_blocked_streams,
                 connect_protocol_enabled,
                 h3_datagram,
+                unbound_data_enabled,
                 additional_settings,
                 raw,
                 ..
@@ -3094,6 +3416,7 @@ impl Connection {
                     qpack_blocked_streams,
                     connect_protocol_enabled,
                     h3_datagram,
+                    unbound_data_enabled,
                     additional_settings,
                     raw,
                 };
@@ -3318,6 +3641,8 @@ impl Connection {
                     return Err(Error::Done);
                 }
 
+                let unbound_data_enabled = self.unbound_data_enabled_locally();
+
                 // If the stream did not yet exist, create it and store.
                 let stream = self
                     .streams
@@ -3330,6 +3655,7 @@ impl Connection {
                                 SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT,
                             ),
                             self.max_priority_update_size,
+                            unbound_data_enabled,
                         )
                     });
 
@@ -3809,6 +4135,248 @@ mod tests {
     /// Make sure that random GREASE values is within the specified limit.
     fn grease_value_in_varint_limit() {
         assert!(grease_value() < 2u64.pow(62) - 1);
+    }
+
+    /// Builds a session where both endpoints advertise unbound data support.
+    fn unbound_session() -> Session {
+        let (mut config, mut h3_config) = Session::default_configs().unwrap();
+        config.set_initial_max_data(1_000_000);
+        config.set_initial_max_stream_data_bidi_local(1_000_000);
+        config.set_initial_max_stream_data_bidi_remote(1_000_000);
+        h3_config.enable_unbound_data(true);
+
+        let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
+        s.handshake().unwrap();
+
+        s
+    }
+
+    #[test]
+    /// Both endpoints advertise the setting, so both may send the frame.
+    fn unbound_data_negotiated() {
+        let mut s = unbound_session();
+
+        // The settings are only known once they have been processed.
+        assert_eq!(s.poll_client(), Err(Error::Done));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        assert!(s.client.unbound_data_enabled_by_peer());
+        assert!(s.server.unbound_data_enabled_by_peer());
+    }
+
+    #[test]
+    /// Without the setting, neither endpoint may send the frame.
+    fn unbound_data_not_negotiated() {
+        let mut s = Session::new().unwrap();
+        s.handshake().unwrap();
+
+        let (stream, _) = s.send_request(false).unwrap();
+        assert!(s.poll_server().is_ok());
+        assert_eq!(s.poll_client(), Err(Error::Done));
+
+        assert!(!s.client.unbound_data_enabled_by_peer());
+
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 3: endpoints
+        // MUST NOT send the frame to a peer which did not advertise support.
+        assert_eq!(
+            s.client.send_unbound_data(&mut s.pipe.client, stream),
+            Err(Error::FrameUnexpected)
+        );
+
+        // Nothing was written, so the request can continue as usual.
+        assert_eq!(
+            s.client.send_body(&mut s.pipe.client, stream, b"framed", true),
+            Ok(6)
+        );
+    }
+
+    #[test]
+    /// Tunnel data reaches the peer through `recv_body()`, unframed.
+    fn unbound_data_transparent() {
+        let mut s = unbound_session();
+
+        let (stream, req) = s.send_request(false).unwrap();
+        assert_eq!(s.poll_server(), Ok((stream, Event::Headers {
+            list: req,
+            more_frames: true
+        })));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        s.client
+            .send_unbound_data(&mut s.pipe.client, stream)
+            .unwrap();
+        assert_eq!(
+            s.client.send_body(&mut s.pipe.client, stream, b"tunnel", true),
+            Ok(6)
+        );
+        s.advance().ok();
+
+        // The switch is reported once, before any tunnel data.
+        assert_eq!(s.poll_server(), Ok((stream, Event::UnboundData)));
+        assert_eq!(s.poll_server(), Ok((stream, Event::Data)));
+
+        // Exactly the payload, with no frame header in front of it.
+        let mut body = [0; 16];
+        assert_eq!(s.recv_body_server(stream, &mut body), Ok(6));
+        assert_eq!(&body[..6], b"tunnel");
+
+        assert_eq!(s.poll_server(), Ok((stream, Event::Finished)));
+    }
+
+    #[test]
+    /// A taken-over stream is read straight from the transport.
+    fn unbound_data_handoff() {
+        let mut s = unbound_session();
+
+        let (stream, _) = s.send_request(false).unwrap();
+        assert!(s.poll_server().is_ok());
+
+        s.client
+            .send_unbound_data(&mut s.pipe.client, stream)
+            .unwrap();
+        assert_eq!(
+            s.client.send_body(&mut s.pipe.client, stream, b"tunnel", true),
+            Ok(6)
+        );
+        s.advance().ok();
+
+        assert_eq!(s.poll_server(), Ok((stream, Event::UnboundData)));
+
+        // Nothing is buffered on HTTP/3's side, so every tunnel byte is still
+        // in the transport's receive buffer.
+        s.server.take_unbound_stream(stream).unwrap();
+
+        let mut body = [0; 16];
+        assert_eq!(s.pipe.server.stream_recv(stream, &mut body), Ok((6, true)));
+        assert_eq!(&body[..6], b"tunnel");
+
+        // HTTP/3 no longer touches the stream.
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert_eq!(
+            s.server.recv_body(&mut s.pipe.server, stream, &mut body),
+            Err(Error::FrameUnexpected)
+        );
+    }
+
+    #[test]
+    /// Receiving the frame without having advertised support is an error.
+    fn unbound_data_not_advertised_locally() {
+        let mut s = Session::new().unwrap();
+        s.handshake().unwrap();
+
+        let (stream, _) = s.send_request(false).unwrap();
+        assert!(s.poll_server().is_ok());
+
+        // The client ignores its own setting and sends the frame anyway.
+        s.send_frame_client(frame::Frame::UnboundData, stream, false)
+            .unwrap();
+
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 3.
+        assert_eq!(s.poll_server(), Err(Error::FrameUnexpected));
+    }
+
+    #[test]
+    /// A non-zero length is a frame error.
+    fn unbound_data_non_zero_length() {
+        let mut s = unbound_session();
+
+        let (stream, _) = s.send_request(false).unwrap();
+        assert!(s.poll_server().is_ok());
+
+        // UNBOUND_DATA with a one byte payload.
+        let mut d = [42; 16];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+        b.put_varint(frame::UNBOUND_DATA_FRAME_TYPE_ID).unwrap();
+        b.put_varint(1).unwrap();
+        b.put_u8(0).unwrap();
+        let off = b.off();
+
+        s.send_arbitrary_stream_data_client(&d[..off], stream, false)
+            .unwrap();
+
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.1.
+        assert_eq!(s.poll_server(), Err(Error::FrameError));
+    }
+
+    #[test]
+    /// The frame must follow the HEADERS which opened the tunnel.
+    fn unbound_data_before_headers() {
+        let mut s = unbound_session();
+
+        s.send_frame_client(frame::Frame::UnboundData, 0, false)
+            .unwrap();
+
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.
+        assert_eq!(s.poll_server(), Err(Error::FrameUnexpected));
+    }
+
+    #[test]
+    /// The frame is only valid on request streams.
+    fn unbound_data_on_control_stream() {
+        let mut s = unbound_session();
+
+        let control = s.client.control_stream_id.unwrap();
+        s.send_frame_client(frame::Frame::UnboundData, control, false)
+            .unwrap();
+
+        assert_eq!(s.poll_server(), Err(Error::FrameUnexpected));
+    }
+
+    #[test]
+    /// Nothing may be sent after the sending side goes unbound.
+    fn unbound_data_no_trailers() {
+        let mut s = unbound_session();
+
+        let (stream, _) = s.send_request(false).unwrap();
+        assert!(s.poll_server().is_ok());
+
+        s.client
+            .send_unbound_data(&mut s.pipe.client, stream)
+            .unwrap();
+
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.2.
+        let trailers = [Header::new(b"trailer", b"value")];
+        assert_eq!(
+            s.client.send_additional_headers(
+                &mut s.pipe.client,
+                stream,
+                &trailers,
+                true,
+                true
+            ),
+            Err(Error::FrameUnexpected)
+        );
+    }
+
+    #[test]
+    /// The setting only accepts 0 and 1.
+    fn unbound_data_invalid_setting_value() {
+        let frame = frame::Frame::Settings {
+            max_field_section_size: None,
+            qpack_max_table_capacity: None,
+            qpack_blocked_streams: None,
+            connect_protocol_enabled: None,
+            h3_datagram: None,
+            unbound_data_enabled: Some(2),
+            grease: None,
+            additional_settings: None,
+            raw: None,
+        };
+
+        let mut d = [42; 128];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+        let len = frame.to_bytes(&mut b).unwrap();
+
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 3.
+        let payload = &d[2..len];
+        assert_eq!(
+            frame::Frame::from_bytes(
+                frame::SETTINGS_FRAME_TYPE_ID,
+                payload.len() as u64,
+                payload
+            ),
+            Err(Error::SettingsError)
+        );
     }
 
     #[test]
@@ -6980,6 +7548,7 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: Some(1),
+            unbound_data_enabled: None,
             grease: None,
             additional_settings: Default::default(),
             raw: Default::default(),
@@ -7118,6 +7687,7 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: None,
+            unbound_data_enabled: None,
             grease: None,
             additional_settings: Default::default(),
             raw: Default::default(),

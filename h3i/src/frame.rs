@@ -289,6 +289,7 @@ fn frame_name(frame: &QFrame) -> &'static str {
         QFrame::MaxPushId { .. } => "MAX_PUSH_ID",
         QFrame::PriorityUpdateRequest { .. } => "PRIORITY_UPDATE(REQUEST)",
         QFrame::PriorityUpdatePush { .. } => "PRIORITY_UPDATE(PUSH)",
+        QFrame::UnboundData => "UNBOUND_DATA",
         QFrame::Unknown { .. } => "UNKNOWN",
     }
 }
@@ -332,11 +333,12 @@ impl Serialize for SerializableQFrame<'_> {
                 qpack_blocked_streams,
                 connect_protocol_enabled,
                 h3_datagram,
+                unbound_data_enabled,
                 grease: _,
                 additional_settings,
                 raw: _,
             } => {
-                let mut state = s.serialize_struct(name, 6)?;
+                let mut state = s.serialize_struct(name, 7)?;
                 state.serialize_field(
                     "max_field_section_size",
                     &max_field_section_size,
@@ -354,6 +356,10 @@ impl Serialize for SerializableQFrame<'_> {
                     &connect_protocol_enabled,
                 )?;
                 state.serialize_field("h3_datagram", &h3_datagram)?;
+                state.serialize_field(
+                    "unbound_data_enabled",
+                    &unbound_data_enabled,
+                )?;
                 state.serialize_field(
                     "additional_settings",
                     &additional_settings,
@@ -429,6 +435,11 @@ impl Serialize for SerializableQFrame<'_> {
                     "priority_field_value",
                     &String::from_utf8_lossy(&priority_field_value[..max]),
                 )?;
+                state.end()
+            },
+
+            QFrame::UnboundData => {
+                let state = s.serialize_struct(name, 0)?;
                 state.end()
             },
 

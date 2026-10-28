@@ -38,6 +38,8 @@ pub const GOAWAY_FRAME_TYPE_ID: u64 = 0x7;
 pub const MAX_PUSH_FRAME_TYPE_ID: u64 = 0xD;
 pub const PRIORITY_UPDATE_FRAME_REQUEST_TYPE_ID: u64 = 0xF0700;
 pub const PRIORITY_UPDATE_FRAME_PUSH_TYPE_ID: u64 = 0xF0701;
+// draft-rosomakho-httpbis-h3-unbound-data-02, Section 7.2
+pub const UNBOUND_DATA_FRAME_TYPE_ID: u64 = 0x2a93_7388;
 
 pub const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x1;
 pub const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 0x6;
@@ -45,6 +47,8 @@ pub const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x7;
 pub const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x8;
 pub const SETTINGS_H3_DATAGRAM_00: u64 = 0x276;
 pub const SETTINGS_H3_DATAGRAM: u64 = 0x33;
+// draft-rosomakho-httpbis-h3-unbound-data-02, Section 7.1
+pub const SETTINGS_ENABLE_UNBOUND_DATA: u64 = 0x282c_f6bb;
 
 // Permit between 16 maximally-encoded and 128 minimally-encoded SETTINGS.
 pub(crate) const MAX_SETTINGS_PAYLOAD_SIZE: usize = 256;
@@ -69,6 +73,7 @@ pub enum Frame {
         qpack_blocked_streams: Option<u64>,
         connect_protocol_enabled: Option<u64>,
         h3_datagram: Option<u64>,
+        unbound_data_enabled: Option<u64>,
         grease: Option<(u64, u64)>,
         additional_settings: Option<Vec<(u64, u64)>>,
         raw: Option<Vec<(u64, u64)>>,
@@ -96,6 +101,14 @@ pub enum Frame {
         prioritized_element_id: u64,
         priority_field_value: Vec<u8>,
     },
+
+    /// Ends HTTP/3 framing on a CONNECT stream.
+    ///
+    /// Every octet which follows on this direction of the stream is tunneled
+    /// data, up to the QUIC FIN. The frame carries no payload.
+    ///
+    /// See draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.
+    UnboundData,
 
     Unknown {
         raw_type: u64,
@@ -141,6 +154,18 @@ impl Frame {
             PRIORITY_UPDATE_FRAME_PUSH_TYPE_ID =>
                 parse_priority_update(frame_type, payload_length, &mut b)?,
 
+            // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.1:
+            // The `UNBOUND_DATA` frame has no payload. The Length field of the
+            // frame MUST be zero. If a nonzero length is received, the endpoint
+            // must treat this as a connection error of type `H3_FRAME_ERROR`.
+            UNBOUND_DATA_FRAME_TYPE_ID => {
+                if payload_length != 0 {
+                    return Err(super::Error::FrameError);
+                }
+
+                Frame::UnboundData
+            },
+
             _ => Frame::Unknown {
                 raw_type: frame_type,
                 payload: b.get_bytes(payload_length as usize)?.to_vec(),
@@ -181,6 +206,7 @@ impl Frame {
                 qpack_blocked_streams,
                 connect_protocol_enabled,
                 h3_datagram,
+                unbound_data_enabled,
                 grease,
                 additional_settings,
                 ..
@@ -211,6 +237,11 @@ impl Frame {
                     len += octets::varint_len(SETTINGS_H3_DATAGRAM_00);
                     len += octets::varint_len(*val);
                     len += octets::varint_len(SETTINGS_H3_DATAGRAM);
+                    len += octets::varint_len(*val);
+                }
+
+                if let Some(val) = unbound_data_enabled {
+                    len += octets::varint_len(SETTINGS_ENABLE_UNBOUND_DATA);
                     len += octets::varint_len(*val);
                 }
 
@@ -253,6 +284,11 @@ impl Frame {
                     b.put_varint(SETTINGS_H3_DATAGRAM_00)?;
                     b.put_varint(*val)?;
                     b.put_varint(SETTINGS_H3_DATAGRAM)?;
+                    b.put_varint(*val)?;
+                }
+
+                if let Some(val) = unbound_data_enabled {
+                    b.put_varint(SETTINGS_ENABLE_UNBOUND_DATA)?;
                     b.put_varint(*val)?;
                 }
 
@@ -323,6 +359,13 @@ impl Frame {
                 b.put_bytes(priority_field_value)?;
             },
 
+            Frame::UnboundData => {
+                b.put_varint(UNBOUND_DATA_FRAME_TYPE_ID)?;
+                // The payload length is always zero: what follows on the stream
+                // is tunneled data, not a frame payload.
+                b.put_varint(0)?;
+            },
+
             Frame::Unknown { raw_type, payload } => {
                 b.put_varint(*raw_type)?;
                 b.put_varint(payload.len() as u64)?;
@@ -360,6 +403,7 @@ impl Frame {
                 qpack_blocked_streams,
                 connect_protocol_enabled,
                 h3_datagram,
+                unbound_data_enabled,
                 grease,
                 additional_settings,
                 ..
@@ -403,6 +447,14 @@ impl Frame {
                 if let Some(v) = h3_datagram {
                     settings.push(qlog::events::http3::Setting {
                         name: Some("H3_DATAGRAM".to_string()),
+                        name_bytes: None,
+                        value: *v,
+                    });
+                }
+
+                if let Some(v) = unbound_data_enabled {
+                    settings.push(qlog::events::http3::Setting {
+                        name: Some("ENABLE_UNBOUND_DATA".to_string()),
                         name_bytes: None,
                         value: *v,
                     });
@@ -471,6 +523,11 @@ impl Frame {
                     priority_field_value,
                 )
                 .into_owned(),
+                raw: None,
+            },
+
+            Frame::UnboundData => Http3Frame::Unknown {
+                frame_type_bytes: UNBOUND_DATA_FRAME_TYPE_ID,
                 raw: None,
             },
 
@@ -556,6 +613,10 @@ impl std::fmt::Debug for Frame {
                 )?;
             },
 
+            Frame::UnboundData => {
+                write!(f, "UNBOUND_DATA")?;
+            },
+
             Frame::Unknown { raw_type, .. } => {
                 write!(f, "UNKNOWN raw_type={raw_type}",)?;
             },
@@ -573,6 +634,7 @@ fn parse_settings_frame(
     let mut qpack_blocked_streams = None;
     let mut connect_protocol_enabled = None;
     let mut h3_datagram = None;
+    let mut unbound_data_enabled = None;
     let mut raw = Vec::new();
     let mut additional_settings: Option<Vec<(u64, u64)>> = None;
 
@@ -618,6 +680,17 @@ fn parse_settings_frame(
                 h3_datagram = Some(value);
             },
 
+            // draft-rosomakho-httpbis-h3-unbound-data-02, Section 3:
+            // Valid values are 0 and 1. Receipt of different values must be
+            // treated as a connection error of type `H3_SETTINGS_ERROR`.
+            SETTINGS_ENABLE_UNBOUND_DATA => {
+                if value > 1 {
+                    return Err(super::Error::SettingsError);
+                }
+
+                unbound_data_enabled = Some(value);
+            },
+
             // Reserved values overlap with HTTP/2 and MUST be rejected
             0x0 | 0x2 | 0x3 | 0x4 | 0x5 =>
                 return Err(super::Error::SettingsError),
@@ -637,6 +710,7 @@ fn parse_settings_frame(
         qpack_blocked_streams,
         connect_protocol_enabled,
         h3_datagram,
+        unbound_data_enabled,
         grease: None,
         raw: Some(raw),
         additional_settings,
@@ -788,6 +862,7 @@ mod tests {
             qpack_blocked_streams: Some(0),
             connect_protocol_enabled: Some(0),
             h3_datagram: Some(0),
+            unbound_data_enabled: None,
             grease: None,
             raw: Some(raw_settings),
             additional_settings: None,
@@ -824,6 +899,7 @@ mod tests {
             qpack_blocked_streams: Some(0),
             connect_protocol_enabled: Some(0),
             h3_datagram: Some(0),
+            unbound_data_enabled: None,
             grease: Some((33, 33)),
             raw: Default::default(),
             additional_settings: None,
@@ -847,6 +923,7 @@ mod tests {
             qpack_blocked_streams: Some(0),
             connect_protocol_enabled: Some(0),
             h3_datagram: Some(0),
+            unbound_data_enabled: None,
             grease: None,
             raw: Some(raw_settings),
             additional_settings: Some(vec![(33, 33)]),
@@ -885,6 +962,7 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: None,
+            unbound_data_enabled: None,
             grease: None,
             raw: Some(raw_settings),
             additional_settings: None,
@@ -923,6 +1001,7 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: Some(1),
             h3_datagram: None,
+            unbound_data_enabled: None,
             grease: None,
             raw: Some(raw_settings),
             additional_settings: None,
@@ -961,6 +1040,7 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: Some(9),
             h3_datagram: None,
+            unbound_data_enabled: None,
             grease: None,
             raw: Some(raw_settings),
             additional_settings: None,
@@ -999,6 +1079,7 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: Some(1),
+            unbound_data_enabled: None,
             grease: None,
             raw: Some(raw_settings),
             additional_settings: None,
@@ -1035,6 +1116,7 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: Some(5),
+            unbound_data_enabled: None,
             grease: None,
             raw: Default::default(),
             additional_settings: None,
@@ -1075,6 +1157,7 @@ mod tests {
             qpack_blocked_streams: Some(0),
             connect_protocol_enabled: None,
             h3_datagram: None,
+            unbound_data_enabled: None,
             grease: None,
             raw: Some(raw_settings),
             additional_settings: None,

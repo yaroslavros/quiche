@@ -1172,6 +1172,10 @@ enum quiche_h3_event_type {
     QUICHE_H3_EVENT_GOAWAY,
     QUICHE_H3_EVENT_RESET,
     QUICHE_H3_EVENT_PRIORITY_UPDATE,
+
+    // An UNBOUND_DATA frame was received: the rest of this direction of the
+    // stream is tunnel data with no HTTP/3 framing.
+    QUICHE_H3_EVENT_UNBOUND_DATA,
 };
 
 typedef struct quiche_h3_event quiche_h3_event;

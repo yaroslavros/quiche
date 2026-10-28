@@ -39,6 +39,7 @@ pub mod test_utils;
 mod tests;
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
@@ -298,6 +299,19 @@ pub enum H3Event {
     /// don't result from RST_STREAM frames, unlike the
     /// [`H3Event::ResetStream`] variant.
     StreamClosed { stream_id: u64 },
+    /// An `UNBOUND_DATA` frame was received on a CONNECT stream: the data which
+    /// follows on that direction carries no HTTP/3 framing.
+    ///
+    /// Body data keeps arriving as [`InboundFrame::Body`] either way. If the
+    /// stream was switched with [`OutboundFrame::UnboundData`] with
+    /// `take_over` set, the driver also stops running the tunnel through
+    /// HTTP/3 and moves the bytes straight on the transport.
+    ///
+    /// See [draft-rosomakho-httpbis-h3-unbound-data].
+    ///
+    /// [draft-rosomakho-httpbis-h3-unbound-data]:
+    ///     https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/
+    UnboundData { stream_id: u64 },
     /// A GOAWAY frame was received from the peer containing `id`,
     /// as described in https://datatracker.ietf.org/doc/html/rfc9114#section-5.2.
     GoAway { id: u64 },
@@ -331,6 +345,23 @@ pub enum OutboundFrame {
     Datagram(DgramBuffer, u64),
     /// Close the stream with a trailers, with optional priority.
     Trailers(Vec<h3::Header>, Option<quiche::h3::Priority>),
+    /// Stop HTTP/3 framing on this endpoint's sending side of a CONNECT
+    /// stream, by sending an `UNBOUND_DATA` frame.
+    ///
+    /// Subsequent [`OutboundFrame::Body`] frames are written with no frame
+    /// header. With `take_over` set, the driver additionally hands the stream
+    /// over to the transport once both directions are unbound, taking HTTP/3
+    /// out of the data path; the application keeps using the same channels
+    /// either way.
+    ///
+    /// Only valid on CONNECT streams, and only if the peer advertised
+    /// `SETTINGS_ENABLE_UNBOUND_DATA`.
+    ///
+    /// See [draft-rosomakho-httpbis-h3-unbound-data].
+    ///
+    /// [draft-rosomakho-httpbis-h3-unbound-data]:
+    ///     https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/
+    UnboundData { take_over: bool },
     /// An error encountered when serving the request. Stream should be closed.
     PeerStreamError,
     /// DATAGRAM flow explicitly closed.
@@ -400,6 +431,11 @@ pub struct H3Driver<H: DriverHooks> {
     /// [`DEFAULT_MAX_BODY_RECV_BUF_SIZE`], so this is always non-zero.
     max_recv_body_buf_size: usize,
 
+    /// Streams the application took over after they went unbound. HTTP/3 no
+    /// longer reports them from `poll()`, so the driver drives their reads
+    /// itself.
+    released_streams: BTreeSet<u64>,
+
     /// The maximum HTTP/3 stream ID seen on this connection.
     max_stream_seen: u64,
 
@@ -437,7 +473,9 @@ impl<H: DriverHooks> H3Driver<H> {
 
                 dgram_recv,
                 dgram_send: PollSender::new(dgram_send),
-                max_stream_seen: 0,
+                released_streams: BTreeSet::new(),
+
+            max_stream_seen: 0,
                 body_recv_buf: None,
                 // `Some(0)` would make `recv_body_buf` a no-op, so treat it as
                 // unset.
@@ -608,7 +646,21 @@ impl<H: DriverHooks> H3Driver<H> {
             if body_recv_buf.remaining_mut() < want {
                 *body_recv_buf = BytesMut::with_capacity(want).limit(want);
             }
-            match conn.recv_body_buf(qconn, stream_id, &mut *body_recv_buf) {
+            // A taken-over stream is read straight from the transport:
+            // HTTP/3 no longer owns it, and its bytes carry no framing.
+            let read = if ctx.released {
+                qconn
+                    .stream_recv_buf(stream_id, &mut *body_recv_buf)
+                    .map(|(n, _fin)| n)
+                    .map_err(|e| match e {
+                        quiche::Error::Done => h3::Error::Done,
+                        e => h3::Error::TransportError(e),
+                    })
+            } else {
+                conn.recv_body_buf(qconn, stream_id, &mut *body_recv_buf)
+            };
+
+            match read {
                 Ok(n) => {
                     ctx.audit_stats.add_downstream_bytes_recvd(n as u64);
                     let event = H3Event::BodyBytesReceived {
@@ -745,6 +797,39 @@ impl<H: DriverHooks> H3Driver<H> {
             h3::Event::Data => self.process_h3_data(qconn, stream_id),
             h3::Event::Finished => self.process_h3_fin(qconn, stream_id),
 
+            h3::Event::UnboundData => {
+                if let Some(ctx) = self.stream_map.get_mut(&stream_id) {
+                    ctx.unbound_recv = true;
+
+                    // The application asked for the stream, and the receiving
+                    // side has now stopped being framed, so HTTP/3 has nothing
+                    // left to parse on it. Nothing is buffered on its side, so
+                    // no tunnel data is lost in the handover.
+                    if ctx.take_over && !ctx.released {
+                        let conn = self
+                            .conn
+                            .as_mut()
+                            .ok_or(Self::connection_not_present())?;
+
+                        if conn.take_unbound_stream(stream_id).is_ok() {
+                            self.stream_map
+                                .get_mut(&stream_id)
+                                .expect("stream was just looked up")
+                                .released = true;
+
+                            self.released_streams.insert(stream_id);
+                        }
+                    }
+                }
+
+                self.h3_event_sender
+                    .send(H3Event::UnboundData { stream_id }.into())
+                    .map_err(|_| H3ConnectionError::ControllerWentAway)?;
+
+                // Tunnel data may already be readable behind the frame.
+                self.process_h3_data(qconn, stream_id)
+            },
+
             h3::Event::Reset(code) => {
                 if let Some(ctx) = self.stream_map.get_mut(&stream_id) {
                     ctx.handle_recvd_reset(code)?;
@@ -862,6 +947,23 @@ impl<H: DriverHooks> H3Driver<H> {
                 return res;
             },
 
+            Some(OutboundFrame::UnboundData { take_over }) => {
+                let take_over = *take_over;
+
+                // Stops framing this endpoint's sending side. The peer may
+                // switch its own direction independently, so the receive side
+                // is untouched here.
+                conn.send_unbound_data(qconn, ctx.audit_stats.stream_id())?;
+
+                ctx.unbound_send = true;
+                ctx.take_over |= take_over;
+
+                // If the peer already switched, the handover is completed by
+                // `try_take_over_stream()` once this returns: this function
+                // has no `self` to record it on.
+                return Ok(());
+            },
+
             Some(OutboundFrame::Body(body, fin)) if !body.is_empty() || *fin => {
                 let len = body.len();
 
@@ -873,7 +975,17 @@ impl<H: DriverHooks> H3Driver<H> {
                     ctx.recv = None;
                 }
 
-                let n = conn.send_body_zc(qconn, stream_id, body, *fin)?;
+                // A taken-over stream is written straight on the transport,
+                // with neither framing nor HTTP/3 in the path.
+                let n = if ctx.released {
+                    let n = qconn
+                        .stream_send(stream_id, body, *fin)
+                        .map_err(h3::Error::TransportError)?;
+                    bytes::Buf::advance(body, n);
+                    n
+                } else {
+                    conn.send_body_zc(qconn, stream_id, body, *fin)?
+                };
 
                 audit_stats.add_downstream_bytes_sent(n as _);
 
@@ -1204,7 +1316,20 @@ impl<H: DriverHooks> H3Driver<H> {
             // Process each writable frame, queue the next frame for processing
             // and shut down any errored streams.
             match Self::process_write_frame(conn, qconn, ctx) {
-                Ok(()) => ctx.queued_frame = None,
+                Ok(()) => {
+                    ctx.queued_frame = None;
+
+                    // The application asked for the stream and both directions
+                    // are now unbound, so hand it over.
+                    if ctx.take_over &&
+                        ctx.unbound_recv &&
+                        !ctx.released &&
+                        conn.take_unbound_stream(stream_id).is_ok()
+                    {
+                        ctx.released = true;
+                        self.released_streams.insert(stream_id);
+                    }
+                },
                 Err(h3::Error::StreamBlocked | h3::Error::Done) => break,
                 Err(h3::Error::MessageError) => {
                     return self.shutdown_stream(
@@ -1362,6 +1487,30 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
                     return Ok(());
                 },
             };
+        }
+
+        // Streams the application took over are no longer reported by
+        // `h3::poll()`, so their reads are driven here. Taken-over streams are
+        // rare, so the common case only pays an `is_empty()` check.
+        if !self.released_streams.is_empty() {
+            for stream_id in
+                self.released_streams.iter().copied().collect::<Vec<_>>()
+            {
+                if !qconn.stream_readable(stream_id) &&
+                    !qconn.stream_finished(stream_id)
+                {
+                    continue;
+                }
+
+                if self.process_h3_data(qconn, stream_id).is_err() {
+                    self.released_streams.remove(&stream_id);
+                }
+            }
+
+            // Drop the ones whose context is gone, so the set does not grow
+            // with the connection's lifetime.
+            self.released_streams
+                .retain(|stream_id| self.stream_map.contains_key(stream_id));
         }
 
         self.process_available_dgrams(qconn)?;

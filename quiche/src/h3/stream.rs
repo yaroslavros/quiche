@@ -81,6 +81,15 @@ pub enum State {
     /// Reading DATA payload.
     Data,
 
+    /// Reading unbound tunnel data.
+    ///
+    /// Entered when an `UNBOUND_DATA` frame is received on a request stream:
+    /// every octet which follows, up to the QUIC FIN, is tunneled data rather
+    /// than HTTP/3 frames, so the stream never leaves this state.
+    ///
+    /// See draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.2.
+    UnboundData,
+
     /// Reading the push ID.
     PushId,
 
@@ -164,6 +173,21 @@ pub struct Stream {
     /// Whether a `Data` event has been triggered for this stream.
     data_event_triggered: bool,
 
+    /// Whether this endpoint may use unbound data on this stream, i.e. whether
+    /// it advertised `SETTINGS_ENABLE_UNBOUND_DATA`.
+    unbound_data_enabled: bool,
+
+    /// Whether an `UnboundData` event has been triggered for this stream.
+    unbound_event_triggered: bool,
+
+    /// Whether this endpoint sent `UNBOUND_DATA`, so its sending side carries
+    /// tunnel data with no frame headers.
+    send_unbound: bool,
+
+    /// Whether the application took the stream over, in which case HTTP/3 no
+    /// longer reads or writes it at all.
+    released: bool,
+
     /// The last `PRIORITY_UPDATE` frame encoded field value, if any.
     last_priority_update: Option<Vec<u8>>,
 
@@ -196,7 +220,7 @@ impl Stream {
     /// local endpoint, or by the peer.
     pub fn new(
         id: u64, is_local: bool, max_field_section_size: u64,
-        max_priority_update_size: u64,
+        max_priority_update_size: u64, unbound_data_enabled: bool,
     ) -> Stream {
         let (ty, state) = if crate::stream::is_bidi(id) {
             // All bidirectional streams are "request" streams, so we don't
@@ -237,6 +261,11 @@ impl Stream {
             local_finished: false,
 
             data_event_triggered: false,
+
+            unbound_data_enabled,
+            unbound_event_triggered: false,
+            send_unbound: false,
+            released: false,
 
             last_priority_update: None,
 
@@ -330,6 +359,13 @@ impl Stream {
                     (frame::PUSH_PROMISE_FRAME_TYPE_ID, true) =>
                         return Err(Error::FrameUnexpected),
 
+                    // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4:
+                    // The `UNBOUND_DATA` frame is only valid on CONNECT
+                    // streams; receiving it elsewhere is a connection error of
+                    // type `H3_FRAME_UNEXPECTED`.
+                    (frame::UNBOUND_DATA_FRAME_TYPE_ID, true) =>
+                        return Err(Error::FrameUnexpected),
+
                     // All other frames are ignored after initialization.
                     (_, true) => (),
                 }
@@ -355,6 +391,10 @@ impl Stream {
                         return Err(Error::FrameUnexpected),
 
                     frame::MAX_PUSH_FRAME_TYPE_ID =>
+                        return Err(Error::FrameUnexpected),
+
+                    // Only valid on CONNECT streams, which are bidirectional.
+                    frame::UNBOUND_DATA_FRAME_TYPE_ID =>
                         return Err(Error::FrameUnexpected),
 
                     _ => (),
@@ -398,6 +438,19 @@ impl Stream {
             return Err(Error::FrameUnexpected);
         }
 
+        // draft-rosomakho-httpbis-h3-unbound-data-02, Section 3:
+        // Receiving `UNBOUND_DATA` without having advertised
+        // `SETTINGS_ENABLE_UNBOUND_DATA` must be treated as a connection error
+        // of type `H3_FRAME_UNEXPECTED`.
+        //
+        // Note that the frame is only valid on CONNECT streams, but HTTP/3 does
+        // not track request methods: the application is responsible for only
+        // using unbound data on CONNECT streams.
+        if ty == frame::UNBOUND_DATA_FRAME_TYPE_ID && !self.unbound_data_enabled
+        {
+            return Err(Error::FrameUnexpected);
+        }
+
         // HTTP message phase bookkeeping only applies to peer-initiated
         // streams, since it tracks the receive direction.
         if self.is_local {
@@ -423,6 +476,22 @@ impl Stream {
             },
 
             (frame::DATA_FRAME_TYPE_ID, true) => {
+                if self.trailers_received {
+                    return Err(Error::FrameUnexpected);
+                }
+
+                self.data_received = true;
+            },
+
+            // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4:
+            // Endpoints MUST send a `HEADERS` frame before sending an
+            // `UNBOUND_DATA` frame; receipt without a prior `HEADERS` frame is
+            // a connection error of type `H3_FRAME_UNEXPECTED`. Trailers end
+            // the message, so nothing may follow them either.
+            (frame::UNBOUND_DATA_FRAME_TYPE_ID, false) =>
+                return Err(Error::FrameUnexpected),
+
+            (frame::UNBOUND_DATA_FRAME_TYPE_ID, true) => {
                 if self.trailers_received {
                     return Err(Error::FrameUnexpected);
                 }
@@ -509,6 +578,19 @@ impl Stream {
                 }
 
                 (State::FramePayload, true)
+            },
+
+            // draft-rosomakho-httpbis-h3-unbound-data-02, Section 4.1:
+            // The Length field of the frame MUST be zero; a nonzero length is a
+            // connection error of type `H3_FRAME_ERROR`. What follows on the
+            // stream is tunnel data rather than a frame payload, so the stream
+            // stays in `UnboundData` until it ends.
+            Some(frame::UNBOUND_DATA_FRAME_TYPE_ID) => {
+                if len != 0 {
+                    return Err(Error::FrameError);
+                }
+
+                (State::UnboundData, false)
             },
 
             // Ignore unknown frames' payloads.
@@ -877,6 +959,37 @@ impl Stream {
         Ok((len, fin))
     }
 
+    /// Tries to read unbound tunnel data into the given buffer.
+    ///
+    /// Unlike [`Stream::try_consume_data`] there is no frame length to respect:
+    /// everything up to the QUIC FIN is tunnel data, so the stream stays in
+    /// [`State::UnboundData`] and no state transition ever follows.
+    pub fn try_consume_unbound_data<F: BufFactory, OUT: bytes::BufMut>(
+        &mut self, conn: &mut crate::Connection<F>, out: OUT,
+    ) -> Result<(usize, bool)> {
+        debug_assert_eq!(self.state, State::UnboundData);
+
+        let (len, fin) = match conn.stream_recv_buf(self.id, out) {
+            Ok(v) => v,
+
+            Err(e) => {
+                // The stream is not readable anymore, so re-arm the Data event.
+                if e == crate::Error::Done {
+                    self.reset_data_event();
+                }
+
+                return Err(e.into());
+            },
+        };
+
+        // The stream is not readable anymore, so re-arm the Data event.
+        if !conn.stream_readable(self.id) {
+            self.reset_data_event();
+        }
+
+        Ok((len, fin))
+    }
+
     /// Marks the stream as finished.
     pub fn finished(&mut self) {
         let _ = self.state_transition(State::Finished, 0, false);
@@ -920,6 +1033,47 @@ impl Stream {
     /// Resets the data triggered state.
     fn reset_data_event(&mut self) {
         self.data_event_triggered = false;
+    }
+
+    /// Returns `true` if an `UNBOUND_DATA` frame was received on this stream,
+    /// so the data which follows carries no HTTP/3 framing.
+    pub fn recv_unbound(&self) -> bool {
+        self.state == State::UnboundData
+    }
+
+    /// Tries to update the unbound event triggered state for the stream.
+    ///
+    /// Returns `true` the first time it is called, so the event is reported
+    /// exactly once per stream.
+    pub fn try_trigger_unbound_event(&mut self) -> bool {
+        if self.unbound_event_triggered {
+            return false;
+        }
+
+        self.unbound_event_triggered = true;
+
+        true
+    }
+
+    /// Returns `true` if this endpoint sent `UNBOUND_DATA` on this stream.
+    pub fn send_unbound(&self) -> bool {
+        self.send_unbound
+    }
+
+    /// Marks this endpoint's sending side as carrying unbound tunnel data.
+    pub fn set_send_unbound(&mut self) {
+        self.send_unbound = true;
+    }
+
+    /// Returns `true` if the application took this stream over.
+    pub fn released(&self) -> bool {
+        self.released
+    }
+
+    /// Marks the stream as taken over by the application, after which HTTP/3
+    /// neither reads nor writes it.
+    pub fn release(&mut self) {
+        self.released = true;
     }
 
     /// Set the last priority update for the stream.
@@ -996,6 +1150,7 @@ mod tests {
             false,
             SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT,
             PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+            true,
         );
         assert_eq!(stream.state, State::StreamType);
 
@@ -1010,6 +1165,7 @@ mod tests {
             false,
             SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT,
             PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+            true,
         )
     }
 
@@ -1082,6 +1238,7 @@ mod tests {
             qpack_blocked_streams: Some(0),
             connect_protocol_enabled: None,
             h3_datagram: None,
+            unbound_data_enabled: None,
             grease: None,
             additional_settings: None,
             raw: Some(raw_settings),
@@ -1132,6 +1289,7 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: None,
+            unbound_data_enabled: None,
             grease: None,
             additional_settings: None,
             raw: Some(vec![]),
@@ -1188,6 +1346,7 @@ mod tests {
             qpack_blocked_streams: Some(0),
             connect_protocol_enabled: None,
             h3_datagram: None,
+            unbound_data_enabled: None,
             grease: None,
             additional_settings: None,
             raw: Some(raw_settings),
@@ -1253,6 +1412,7 @@ mod tests {
             qpack_blocked_streams: Some(0),
             connect_protocol_enabled: None,
             h3_datagram: None,
+            unbound_data_enabled: None,
             grease: None,
             additional_settings: None,
             raw: Some(raw_settings),
@@ -1297,6 +1457,7 @@ mod tests {
             qpack_blocked_streams: Some(0),
             connect_protocol_enabled: None,
             h3_datagram: None,
+            unbound_data_enabled: None,
             grease: None,
             additional_settings: None,
             raw: Some(raw_settings),
@@ -1686,6 +1847,7 @@ mod tests {
                 PRIORITY_UPDATE_FRAME_REQUEST_TYPE_ID,
             Frame::PriorityUpdatePush { .. } =>
                 PRIORITY_UPDATE_FRAME_PUSH_TYPE_ID,
+            Frame::UnboundData => UNBOUND_DATA_FRAME_TYPE_ID,
             Frame::Unknown { .. } => unreachable!(),
         }
     }
@@ -1765,6 +1927,7 @@ mod tests {
             false,
             4196,
             PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+            true,
         );
 
         // Size the header block so it will fit within the Huffman margin.
@@ -1786,6 +1949,7 @@ mod tests {
             false,
             4196,
             PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+            true,
         );
         let header_block = vec![0; 16384];
         let frame = Frame::Headers {
@@ -1815,6 +1979,7 @@ mod tests {
             false,
             4196,
             PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+            true,
         );
 
         // Size the header block so it will fit within the Huffman margin.
@@ -1837,6 +2002,7 @@ mod tests {
             false,
             4196,
             PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+            true,
         );
         let header_block = vec![0; 16384];
         let frame = Frame::PushPromise {
@@ -1855,6 +2021,7 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: None,
+            unbound_data_enabled: None,
             grease: None,
             additional_settings: None,
             raw: Some(vec![]),
@@ -1870,6 +2037,7 @@ mod tests {
             false,
             SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT,
             20000,
+            true,
         );
         b.put_varint(HTTP3_CONTROL_STREAM_TYPE_ID).unwrap();
         settings.to_bytes(&mut b).unwrap();
@@ -1932,6 +2100,7 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: None,
+            unbound_data_enabled: None,
             grease: None,
             additional_settings: None,
             raw: Some(vec![]),
@@ -1943,7 +2112,13 @@ mod tests {
         // Control stream needs a SETTINGS frame to transition it into
         // being able to parse other frame types.
         let mut stream =
-            <Stream>::new(2, false, SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT, 123);
+            <Stream>::new(
+                2,
+                false,
+                SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT,
+                123,
+                true,
+            );
         b.put_varint(HTTP3_CONTROL_STREAM_TYPE_ID).unwrap();
 
         settings.to_bytes(&mut b).unwrap();
@@ -2002,6 +2177,7 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: None,
+            unbound_data_enabled: None,
             grease: None,
             additional_settings: None,
             raw: Some(vec![]),
@@ -2097,6 +2273,7 @@ mod tests {
             false,
             LARGE_HEADER_LEN as u64,
             PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+            true,
         );
 
         let mut d = vec![42; 20000];
@@ -2179,6 +2356,7 @@ mod tests {
             false,
             LARGE_HEADER_LEN as u64,
             PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+            true,
         );
 
         let mut d = vec![42; LARGE_HEADER_LEN + 10];
@@ -2266,6 +2444,7 @@ mod tests {
             false,
             LARGE_HEADER_LEN as u64,
             PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+            true,
         );
         assert_eq!(stream.state_buf.capacity(), 16);
 

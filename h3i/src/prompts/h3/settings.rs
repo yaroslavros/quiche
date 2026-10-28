@@ -59,6 +59,7 @@ pub fn prompt_settings() -> InquireResult<Action> {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: None,
+            unbound_data_enabled: None,
             grease: None,
             raw: None,
             additional_settings: Some(settings),

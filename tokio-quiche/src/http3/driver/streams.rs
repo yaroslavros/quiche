@@ -254,6 +254,18 @@ pub(crate) struct StreamCtx {
     /// The flow ID for proxying datagrams over this stream. If `None`,
     /// the stream has no associated DATAGRAM flow.
     pub(crate) associated_dgram_flow_id: Option<u64>,
+    /// Whether this endpoint sent `UNBOUND_DATA`, so its body frames are
+    /// written with no HTTP/3 framing.
+    pub(crate) unbound_send: bool,
+    /// Whether the peer sent `UNBOUND_DATA`, so the data arriving on this
+    /// stream carries no HTTP/3 framing.
+    pub(crate) unbound_recv: bool,
+    /// Whether the application asked to take the stream over once it is
+    /// unbound, moving HTTP/3 out of the data path entirely.
+    pub(crate) take_over: bool,
+    /// Whether the stream was taken over, so the driver reads and writes it
+    /// straight on the transport.
+    pub(crate) released: bool,
     /// Whether the outbound channel needs to be re-polled for application data.
     waiting_for_recv: bool,
     waker: Waker,
@@ -287,6 +299,12 @@ impl StreamCtx {
             send_state: SendState::Open,
 
             associated_dgram_flow_id: None,
+
+            unbound_send: false,
+            unbound_recv: false,
+            take_over: false,
+            released: false,
+
             waiting_for_recv: false,
             waker: Waker::from(wake),
         };

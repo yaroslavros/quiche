@@ -718,6 +718,137 @@ mod client_side_driver {
 
     /// Test that dropping the OutboundFrame channel causes the driver to
     /// send a RESET_STREAM frame to the peer.
+    /// A CONNECT tunnel which drops framing in both directions, with the
+    /// stream handed over to the transport.
+    ///
+    /// See draft-rosomakho-httpbis-h3-unbound-data.
+    #[test]
+    fn client_unbound_data_handoff() {
+        let mut helper = DriverTestHelper::<ClientHooks>::with_unbound_data()
+            .unwrap();
+        helper.complete_handshake().unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Open the tunnel.
+        let stream_id = helper
+            .driver_send_request(make_request_headers("CONNECT"), false)
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_matches!(
+            helper.peer_server_poll().unwrap(),
+            (0, h3::Event::Headers { .. })
+        );
+        helper.peer_server_send_response(0, false).unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        let resp = assert_matches!(
+            helper.driver_recv_core_event().unwrap(),
+            H3Event::IncomingHeaders(headers) => { headers }
+        );
+        assert_eq!(resp.stream_id, stream_id);
+        let to_server = resp.send.get_ref().unwrap().clone();
+        let mut from_server = resp.recv;
+
+        // Stop framing our sending side and ask for the handover.
+        to_server
+            .try_send(OutboundFrame::UnboundData { take_over: true })
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_matches!(
+            helper.peer_server_poll().unwrap(),
+            (0, h3::Event::UnboundData)
+        );
+
+        // Tunnel data goes out with no DATA frame header, so the peer reads
+        // back exactly what was written.
+        to_server
+            .try_send(OutboundFrame::Body(Bytes::from_static(b"upstream"), false))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_eq!(
+            helper.peer_server_recv_body_vec(0, 64).unwrap(),
+            b"upstream"
+        );
+
+        // The peer switches its own direction, which completes the handover.
+        helper.peer_send_unbound_data(0).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_matches!(
+            helper.driver_recv_core_event().unwrap(),
+            H3Event::UnboundData { stream_id: id } if id == stream_id
+        );
+        assert!(helper.driver.stream_map[&stream_id].released);
+
+        // From here the driver moves the tunnel straight on the transport, in
+        // both directions.
+        helper.peer_server_send_body(0, b"downstream", false).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_eq!(
+            helper.driver_try_recv_body(&mut from_server).0,
+            b"downstream"
+        );
+
+        to_server
+            .try_send(OutboundFrame::Body(Bytes::from_static(b"more"), true))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_eq!(helper.peer_server_recv_body_vec(0, 64).unwrap(), b"more");
+    }
+
+    /// Without the handover, tunnel data still flows through h3 unframed.
+    #[test]
+    fn client_unbound_data_transparent() {
+        let mut helper = DriverTestHelper::<ClientHooks>::with_unbound_data()
+            .unwrap();
+        helper.complete_handshake().unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        let stream_id = helper
+            .driver_send_request(make_request_headers("CONNECT"), false)
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert!(helper.peer_server_poll().is_ok());
+        helper.peer_server_send_response(0, false).unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        let resp = assert_matches!(
+            helper.driver_recv_core_event().unwrap(),
+            H3Event::IncomingHeaders(headers) => { headers }
+        );
+        let to_server = resp.send.get_ref().unwrap().clone();
+        let mut from_server = resp.recv;
+
+        // The per-stream channel holds a single frame in test builds, so the
+        // loop has to drain each one.
+        to_server
+            .try_send(OutboundFrame::UnboundData { take_over: false })
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_matches!(
+            helper.peer_server_poll().unwrap(),
+            (0, h3::Event::UnboundData)
+        );
+
+        to_server
+            .try_send(OutboundFrame::Body(Bytes::from_static(b"up"), false))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_eq!(helper.peer_server_recv_body_vec(0, 64).unwrap(), b"up");
+
+        // The stream stays with h3, which keeps delivering the tunnel through
+        // `recv_body()`.
+        helper.peer_send_unbound_data(0).unwrap();
+        helper.peer_server_send_body(0, b"down", false).unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        assert_matches!(
+            helper.driver_recv_core_event().unwrap(),
+            H3Event::UnboundData { .. }
+        );
+        assert!(!helper.driver.stream_map[&stream_id].released);
+        assert_eq!(helper.driver_try_recv_body(&mut from_server).0, b"down");
+    }
+
     #[test]
     fn client_send_reset_stream_when_outbound_frame_channel_drops() {
         let mut helper = DriverTestHelper::<ClientHooks>::new().unwrap();

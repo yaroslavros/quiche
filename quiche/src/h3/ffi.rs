@@ -157,6 +157,8 @@ pub extern "C" fn quiche_h3_event_type(ev: &h3::Event) -> u32 {
         h3::Event::Reset { .. } => 4,
 
         h3::Event::PriorityUpdate => 5,
+
+        h3::Event::UnboundData => 6,
     }
 }
 

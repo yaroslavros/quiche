@@ -128,6 +128,35 @@ impl<H: DriverHooks + GetConnectionForHook> DriverTestHelper<H> {
         Self::with_pipe_and_http3_settings(pipe, Http3Settings::default())
     }
 
+    /// Builds a helper where the driver and the peer both advertise
+    /// `SETTINGS_ENABLE_UNBOUND_DATA`, so either side may switch a CONNECT
+    /// stream to unbound data.
+    pub fn with_unbound_data() -> anyhow::Result<Self> {
+        let mut pipe = Pipe::with_config_and_buf(&mut default_quiche_config())?;
+        pipe.handshake().context("Failed to handshake pipe")?;
+
+        let h3_settings = Http3Settings {
+            enable_unbound_data: true,
+            ..Default::default()
+        };
+        let (driver, controller) = H3Driver::<H>::new(h3_settings);
+
+        let mut peer_config = h3::Config::new().unwrap();
+        peer_config.enable_unbound_data(true);
+        let peer = h3::Connection::with_transport(
+            H::peer_qconn(&mut pipe),
+            &peer_config,
+        )
+        .context("create H3 peer connection")?;
+
+        Ok(Self {
+            pipe,
+            driver,
+            controller,
+            peer,
+        })
+    }
+
     pub fn with_pipe_and_http3_settings(
         mut pipe: Pipe, h3_settings: Http3Settings,
     ) -> anyhow::Result<Self> {
@@ -224,6 +253,12 @@ impl<H: DriverHooks + GetConnectionForHook> DriverTestHelper<H> {
     /// Call [`h3::Connection::poll()`] on the peer
     fn poll_peer(&mut self) -> h3::Result<(u64, h3::Event)> {
         self.peer.poll(H::peer_qconn(&mut self.pipe))
+    }
+
+    /// Sends `UNBOUND_DATA` from the peer, stopping its framing.
+    pub fn peer_send_unbound_data(&mut self, stream_id: u64) -> h3::Result<()> {
+        self.peer
+            .send_unbound_data(H::peer_qconn(&mut self.pipe), stream_id)
     }
 
     /// Send a body from the peer

@@ -62,6 +62,16 @@ pub struct Http3Settings {
     /// Set the `SETTINGS_ENABLE_CONNECT_PROTOCOL` HTTP/3 setting.
     /// See <https://www.rfc-editor.org/rfc/rfc9220#section-3-2>
     pub enable_extended_connect: bool,
+
+    /// Whether to advertise `SETTINGS_ENABLE_UNBOUND_DATA`, which tells the
+    /// peer it may send `UNBOUND_DATA` frames on CONNECT streams. The stream
+    /// then carries tunnel data with no HTTP/3 framing.
+    ///
+    /// See [draft-rosomakho-httpbis-h3-unbound-data].
+    ///
+    /// [draft-rosomakho-httpbis-h3-unbound-data]:
+    ///     https://datatracker.ietf.org/doc/draft-rosomakho-httpbis-h3-unbound-data/
+    pub enable_unbound_data: bool,
     /// Maximum size, in bytes, of the buffer the driver uses to read HTTP/3
     /// body data out of quiche before forwarding it upstream.
     ///
@@ -94,6 +104,10 @@ impl From<&Http3Settings> for quiche::h3::Config {
 
         if value.enable_extended_connect {
             config.enable_extended_connect(value.enable_extended_connect)
+        }
+
+        if value.enable_unbound_data {
+            config.enable_unbound_data(value.enable_unbound_data)
         }
 
         config

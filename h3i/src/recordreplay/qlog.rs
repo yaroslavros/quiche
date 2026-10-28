@@ -540,6 +540,7 @@ impl From<H3FrameCreatedEx> for Action {
                         qpack_blocked_streams: None,
                         connect_protocol_enabled: None,
                         h3_datagram: None,
+                        unbound_data_enabled: None,
                         grease: None,
                         raw: Some(raw_settings),
                         additional_settings: Some(additional_settings),

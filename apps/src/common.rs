@@ -1350,6 +1350,16 @@ impl HttpConn for Http3Conn {
                     );
                 },
 
+                Ok((stream_id, quiche::h3::Event::UnboundData)) => {
+                    // These apps never advertise SETTINGS_ENABLE_UNBOUND_DATA,
+                    // so a conforming peer cannot send the frame.
+                    info!(
+                        "{} UNBOUND_DATA on stream id {}",
+                        conn.trace_id(),
+                        stream_id
+                    );
+                },
+
                 Ok((goaway_id, quiche::h3::Event::GoAway)) => {
                     info!(
                         "{} got GOAWAY with ID {} ",
@@ -1542,6 +1552,16 @@ impl HttpConn for Http3Conn {
                         "{} PRIORITY_UPDATE triggered for element ID={}",
                         conn.trace_id(),
                         prioritized_element_id
+                    );
+                },
+
+                Ok((stream_id, quiche::h3::Event::UnboundData)) => {
+                    // These apps never advertise SETTINGS_ENABLE_UNBOUND_DATA,
+                    // so a conforming peer cannot send the frame.
+                    info!(
+                        "{} UNBOUND_DATA on stream id {}",
+                        conn.trace_id(),
+                        stream_id
                     );
                 },
 

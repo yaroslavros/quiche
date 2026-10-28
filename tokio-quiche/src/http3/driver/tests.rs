@@ -716,8 +716,6 @@ mod client_side_driver {
         assert!(helper.driver.body_recv_buf.is_none());
     }
 
-    /// Test that dropping the OutboundFrame channel causes the driver to
-    /// send a RESET_STREAM frame to the peer.
     /// A CONNECT tunnel which drops framing in both directions, with the
     /// stream handed over to the transport.
     ///
@@ -849,6 +847,8 @@ mod client_side_driver {
         assert_eq!(helper.driver_try_recv_body(&mut from_server).0, b"down");
     }
 
+    /// Test that dropping the OutboundFrame channel causes the driver to
+    /// send a RESET_STREAM frame to the peer.
     #[test]
     fn client_send_reset_stream_when_outbound_frame_channel_drops() {
         let mut helper = DriverTestHelper::<ClientHooks>::new().unwrap();

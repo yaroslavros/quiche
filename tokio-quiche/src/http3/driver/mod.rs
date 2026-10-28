@@ -648,14 +648,15 @@ impl<H: DriverHooks> H3Driver<H> {
             }
             // A taken-over stream is read straight from the transport:
             // HTTP/3 no longer owns it, and its bytes carry no framing.
+            //
+            // `From` is what maps `quiche::Error::Done` onto
+            // `h3::Error::Done`, which the loop below reads as "nothing more
+            // to read right now" rather than as a failure.
             let read = if ctx.released {
                 qconn
                     .stream_recv_buf(stream_id, &mut *body_recv_buf)
                     .map(|(n, _fin)| n)
-                    .map_err(|e| match e {
-                        quiche::Error::Done => h3::Error::Done,
-                        e => h3::Error::TransportError(e),
-                    })
+                    .map_err(h3::Error::from)
             } else {
                 conn.recv_body_buf(qconn, stream_id, &mut *body_recv_buf)
             };
@@ -983,10 +984,17 @@ impl<H: DriverHooks> H3Driver<H> {
                 //
                 // The returned remainder is the unsent tail of `body`, which
                 // `advance` leaves in place, so it is dropped here.
+                //
+                // The error is converted with `From`, which turns
+                // `quiche::Error::Done` into `h3::Error::Done` exactly as
+                // `send_body_zc` does: a write that found no send capacity is
+                // retried once the stream is writable again. Wrapping it as a
+                // transport error instead reads as fatal to
+                // `process_writable_stream`, which then tears down a healthy
+                // tunnel the first time congestion control fills up.
                 let n = if ctx.released {
-                    let (n, _tail) = qconn
-                        .stream_send_zc(stream_id, body.clone(), *fin)
-                        .map_err(h3::Error::TransportError)?;
+                    let (n, _tail) =
+                        qconn.stream_send_zc(stream_id, body.clone(), *fin)?;
                     bytes::Buf::advance(body, n);
                     n
                 } else {
